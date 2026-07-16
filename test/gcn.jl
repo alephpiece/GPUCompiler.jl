@@ -5,19 +5,93 @@ sink_gcn(i) = sink(i, Val(5))
 
 @testset "backend selector" begin
     # in the test environment AMDGPU_LLVM_Backend_jll is loaded, so the default is :external
-    @test GCNCompilerTarget(dev_isa="gfx900").backend === :external
+    let target = GCNCompilerTarget(dev_isa="gfx900")
+        @test target.backend === :external
+        @test target.external_llc === nothing
+        @test target.external_opt === nothing
+    end
 
     # both constructor forms accept an explicit backend, alongside the other options
     @test GCNCompilerTarget(dev_isa="gfx900"; backend=:inprocess).backend === :inprocess
     @test GCNCompilerTarget("gfx900"; backend=:inprocess).backend === :inprocess
-    let target = GCNCompilerTarget("gfx900"; features="+wavefrontsize64", backend=:external)
-        @test target.dev_isa == "gfx900"
-        @test target.features == "+wavefrontsize64"
-        @test target.backend === :external
+    @test GCNCompilerTarget("gfx900", "", :inprocess).backend === :inprocess
+
+    # The existing external JLL path retains target-aware Julia LLVM passes.
+    let target = GCNCompilerTarget("gfx900"; backend=:external)
+        @test !GPUCompiler.uses_external_gcn_optimizer(target)
+        @test GPUCompiler.gcn_llvm_target(target) == ("gfx900", "")
+        @test (target.dev_isa, target.features) == ("gfx900", "")
+    end
+
+    # Configuring an external optimizer creates the target-neutral Julia IR to
+    # target-aware external-toolchain hand-off.
+    let target = GCNCompilerTarget("gfx900"; backend=:external,
+                                    external_opt="/path/to/opt")
+        @test GPUCompiler.uses_external_gcn_optimizer(target)
+        @test GPUCompiler.gcn_llvm_target(target) == ("", "")
+    end
+    let target = GCNCompilerTarget("gfx900"; features="+xnack", backend=:inprocess)
+        @test GPUCompiler.gcn_llvm_target(target) == ("gfx900", "+xnack")
+    end
+    withenv("JULIA_GPUCOMPILER_GCN_LLC" => "/path/to/llc") do
+        let target = GCNCompilerTarget("gfx900"; features="+wavefrontsize64")
+            @test target.dev_isa == "gfx900"
+            @test target.features == "+wavefrontsize64"
+            @test target.external_llc == "/path/to/llc"
+            @test target.backend === :external
+        end
+    end
+    withenv("JULIA_GPUCOMPILER_GCN_OPT" => "/path/to/opt") do
+        let target = GCNCompilerTarget("gfx900")
+            @test target.external_opt == "/path/to/opt"
+        end
     end
 
     mod = @eval module $(gensym())
         kernel() = return
+    end
+
+    job_o0, _ = GCN.create_job(mod.kernel, Tuple{}; opt_level=0)
+    job_o3, _ = GCN.create_job(mod.kernel, Tuple{}; opt_level=3)
+    job_noopt, _ = GCN.create_job(mod.kernel, Tuple{}; optimize=false)
+    @test GPUCompiler.gcn_external_opt_pipeline(job_o0) == "default<O0>"
+    @test GPUCompiler.gcn_external_opt_pipeline(job_o3) == "default<O3>"
+    @test GPUCompiler.gcn_external_opt_pipeline(job_noopt) === nothing
+
+    withenv("JULIA_GPUCOMPILER_GCN_LLC" => "/path/that/does/not/exist") do
+        @test_throws "configured external GCN llc does not exist" GCN.code_native(
+            devnull, mod.kernel, Tuple{})
+    end
+
+    withenv("JULIA_GPUCOMPILER_GCN_OPT" => "/path/that/does/not/exist") do
+        @test_throws "configured external GCN opt does not exist" GCN.code_native(
+            devnull, mod.kernel, Tuple{})
+    end
+
+    if Sys.isunix()
+        mktempdir() do dir
+            fake_opt = joinpath(dir, "opt")
+            write(fake_opt, raw"""#!/bin/sh
+set -eu
+input=$1
+output=
+shift
+while [ "$#" -gt 0 ]; do
+    if [ "$1" = "-o" ]; then
+        shift
+        output=$1
+    fi
+    shift
+done
+test -n "$output"
+cp "$input" "$output"
+""")
+            chmod(fake_opt, 0o755)
+
+            withenv("JULIA_GPUCOMPILER_GCN_OPT" => fake_opt) do
+                @test (GCN.code_native(devnull, mod.kernel, Tuple{}); true)
+            end
+        end
     end
 
     # the backend participates in the cache owner, so different back-ends don't share a cache
@@ -54,6 +128,33 @@ end
     @test @filecheck begin
         @check "amdgpu_kernel"
         GCN.code_llvm(mod.kernel, Tuple{}; dump_module=true, kernel=true)
+    end
+end
+
+@testset "late external target attributes" begin
+    mod = @eval module $(gensym())
+        kernel() = return
+    end
+
+    job, _ = GCN.create_job(mod.kernel, Tuple{}; kernel=true)
+    JuliaContext() do ctx
+        ir, meta = GPUCompiler.compile(:llvm, job)
+        attrs = LLVM.function_attributes(meta.entry)
+        push!(attrs, StringAttribute("target-cpu", "existing"))
+
+        target = GCNCompilerTarget("gfx936"; features="+sramecc,-xnack",
+                                    backend=:external, external_opt="/path/to/opt")
+        GPUCompiler.materialize_gcn_target_attributes!(ir, target)
+
+        attrs = collect(LLVM.function_attributes(meta.entry))
+        cpu_attr = only(filter(a -> a isa StringAttribute &&
+                                   kind(a) == "target-cpu", attrs))
+        feature_attr = only(filter(a -> a isa StringAttribute &&
+                                       kind(a) == "target-features", attrs))
+        @test value(cpu_attr) == "existing"
+        @test value(feature_attr) == "+sramecc,-xnack"
+
+        dispose(ir)
     end
 end
 

@@ -4,6 +4,23 @@ const AMDGPU_LLVM_Backend_jll =
     LazyModule("AMDGPU_LLVM_Backend_jll",
                UUID("cc5c0156-bd05-5a77-8a68-bb0aafb29019"))
 
+const GCN_EXTERNAL_LLC_ENV = "JULIA_GPUCOMPILER_GCN_LLC"
+const GCN_EXTERNAL_OPT_ENV = "JULIA_GPUCOMPILER_GCN_OPT"
+
+function configured_gcn_external_tool(env::String, preference::String)
+    tool = get(ENV, env, @load_preference(preference, nothing))
+    tool === nothing && return nothing
+    tool isa AbstractString ||
+        error("The $preference preference must be a string")
+    isempty(tool) && error("The configured external GCN tool path is empty: $preference")
+    String(tool)
+end
+
+configured_gcn_external_llc() =
+    configured_gcn_external_tool(GCN_EXTERNAL_LLC_ENV, "gcn_external_llc")
+configured_gcn_external_opt() =
+    configured_gcn_external_tool(GCN_EXTERNAL_OPT_ENV, "gcn_external_opt")
+
 ## target
 
 export GCNCompilerTarget
@@ -12,13 +29,26 @@ Base.@kwdef struct GCNCompilerTarget <: AbstractCompilerTarget
     dev_isa::String
     features::String=""
 
-    backend::Symbol = isavailable(AMDGPU_LLVM_Backend_jll) ? :external : :inprocess
+    external_llc::Union{Nothing,String} = configured_gcn_external_llc()
+    external_opt::Union{Nothing,String} = configured_gcn_external_opt()
+    backend::Symbol = (external_llc !== nothing || external_opt !== nothing ||
+                       isavailable(AMDGPU_LLVM_Backend_jll)) ? :external : :inprocess
 end
 GCNCompilerTarget(dev_isa; kwargs...) = GCNCompilerTarget(; dev_isa, kwargs...)
+GCNCompilerTarget(dev_isa::AbstractString, features::AbstractString, backend::Symbol) =
+    GCNCompilerTarget(; dev_isa=String(dev_isa), features=String(features), backend)
 
 llvm_triple(::GCNCompilerTarget) = "amdgcn-amd-amdhsa"
 
 source_code(target::GCNCompilerTarget) = "gcn"
+
+uses_external_gcn_optimizer(target::GCNCompilerTarget) =
+    target.backend === :external && target.external_opt !== nothing
+
+function gcn_llvm_target(target::GCNCompilerTarget)
+    uses_external_gcn_optimizer(target) && return ("", "")
+    return target.dev_isa, target.features
+end
 
 function llvm_machine(target::GCNCompilerTarget)
     @static if :AMDGPU ∉ LLVM.backends()
@@ -27,8 +57,11 @@ function llvm_machine(target::GCNCompilerTarget)
     triple = llvm_triple(target)
     t = Target(triple=triple)
 
-    cpu = target.dev_isa
-    feat = target.features
+    # With an external optimizer, Julia's bundled LLVM is responsible only for
+    # target-independent IR processing. The external toolchain receives the real
+    # CPU and feature set immediately before target-aware optimization and code
+    # generation (see `mcgen` below).
+    cpu, feat = gcn_llvm_target(target)
     reloc = LLVM.API.LLVMRelocPIC
     tm = TargetMachine(t, triple, cpu, feat; reloc)
     asm_verbosity!(tm, true)
@@ -155,6 +188,34 @@ function add_kernarg_address_spaces!(
     return new_f
 end
 
+function materialize_gcn_target_attributes!(mod::LLVM.Module,
+                                            target::GCNCompilerTarget)
+    for fn in functions(mod)
+        isdeclaration(fn) && continue
+        LLVM.isintrinsic(fn) && continue
+
+        attrs = LLVM.function_attributes(fn)
+        existing = collect(attrs)
+        any(attr -> attr isa StringAttribute && kind(attr) == "target-cpu", existing) ||
+            push!(attrs, StringAttribute("target-cpu", target.dev_isa))
+        any(attr -> attr isa StringAttribute && kind(attr) == "target-features", existing) ||
+            push!(attrs, StringAttribute("target-features", target.features))
+    end
+    return
+end
+
+function run_external_gcn_command(cmd::Cmd)
+    out = Pipe()
+    proc = run(pipeline(ignorestatus(cmd); stdout=out, stderr=out); wait=false)
+    close(out.in)
+    log = strip(read(out, String))
+    wait(proc)
+    return success(proc), log
+end
+
+gcn_external_opt_pipeline(@nospecialize(job::CompilerJob)) =
+    job.config.optimize ? "default<O$(job.config.opt_level)>" : nothing
+
 @unlocked function mcgen(@nospecialize(job::CompilerJob{GCNCompilerTarget}),
                          mod::LLVM.Module, format=LLVM.API.LLVMAssemblyFile)
     target = job.config.target
@@ -171,9 +232,23 @@ end
               "expected :external or :inprocess.")
     end
 
-    if !isavailable(AMDGPU_LLVM_Backend_jll) || !AMDGPU_LLVM_Backend_jll.is_available()
-        error("The :external GCN back-end requires AMDGPU_LLVM_Backend_jll, which " *
-              "should be installed and loaded first.")
+    llc = if target.external_llc === nothing
+        if !isavailable(AMDGPU_LLVM_Backend_jll) ||
+           !AMDGPU_LLVM_Backend_jll.is_available()
+            error("The :external GCN back-end requires a configured external llc " *
+                  "or AMDGPU_LLVM_Backend_jll")
+        end
+        AMDGPU_LLVM_Backend_jll.llc()
+    else
+        isfile(target.external_llc) ||
+            error("The configured external GCN llc does not exist: $(target.external_llc)")
+        target.external_llc
+    end
+
+    opt = target.external_opt
+    if opt !== nothing
+        isfile(opt) ||
+            error("The configured external GCN opt does not exist: $opt")
     end
 
     filetype = if format == LLVM.API.LLVMAssemblyFile
@@ -185,26 +260,48 @@ end
     end
 
     input  = tempname(cleanup=false) * ".bc"
+    optimized_input = nothing
     output = tempname(cleanup=false) * (filetype == "asm" ? ".s" : ".o")
+    if uses_external_gcn_optimizer(target)
+        # Materialize the real target only after GPUCompiler's Julia-LLVM passes
+        # (including `prepare_execution!`) have finished. Preserve target
+        # attributes supplied by linked device libraries.
+        materialize_gcn_target_attributes!(mod, target)
+    end
     write(input, mod)
 
-    cmd = `$(AMDGPU_LLVM_Backend_jll.llc()) $input
+    llc_input = input
+    opt_pipeline = gcn_external_opt_pipeline(job)
+    if opt !== nothing && opt_pipeline !== nothing
+        optimized_input = tempname(cleanup=false) * ".bc"
+        cmd = `$opt $input -passes=$opt_pipeline -o $optimized_input`
+        tool_success, log = run_external_gcn_command(cmd)
+        if !tool_success
+            msg = "Failed to optimize GCN LLVM IR with external opt"
+            isempty(log) || (msg *= ":\n" * log)
+            msg *= "\nIf you think this is a bug, please file an issue and attach $(input)."
+            isfile(optimized_input) && rm(optimized_input)
+            error(msg)
+        elseif !isempty(log)
+            @warn "External opt reported:\n$log"
+        end
+        llc_input = optimized_input
+    end
+
+    cmd = `$llc $llc_input
               -mtriple=$(llvm_triple(target))
               -mcpu=$(target.dev_isa)
               -mattr=$(target.features)
               --relocation-model=pic
               -filetype=$filetype
               -o $output`
-    out = Pipe()
-    proc = run(pipeline(ignorestatus(cmd); stdout=out, stderr=out); wait=false)
-    close(out.in)
-    log = strip(read(out, String))
-    wait(proc)
-    if !success(proc)
+    tool_success, log = run_external_gcn_command(cmd)
+    if !tool_success
         # keep the input around for debugging
         msg = "Failed to compile to GCN with external llc"
         isempty(log) || (msg *= ":\n" * log)
-        msg *= "\nIf you think this is a bug, please file an issue and attach $(input)."
+        inputs = optimized_input === nothing ? input : "$input and $optimized_input"
+        msg *= "\nIf you think this is a bug, please file an issue and attach $inputs."
         isfile(output) && rm(output)
         error(msg)
     elseif !isempty(log)
@@ -215,6 +312,7 @@ end
 
     code = filetype == "asm" ? read(output, String) : String(read(output))
     rm(input)
+    optimized_input === nothing || rm(optimized_input)
     rm(output)
     return code
 end
